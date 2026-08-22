@@ -1,0 +1,63 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+*.aex
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Visual Studio / MSBuild
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.res
+*.tlog
+*.lastbuildstate
+*.sbr
+*.bsc
+*.recipe
+*.json
+x64/
+x86/
+Debug/
+Release/
+
+# Backup files
+*.bak
+*.bak*
+
+# OS generated files
+.DS_Store
+Thumbs.db
