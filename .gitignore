@@ -61,3 +61,7 @@ Release/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserstate

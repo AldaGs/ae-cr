@@ -57,6 +57,29 @@ extern void CR_CornerRound_CUDA(
 	float profile, int preserveAA, int pad);
 #endif
 
+#if HAS_METAL
+// POD mirror of CRGpuParams in CornerRounder_Metal.mm / _Kernel_Metal.h. The host
+// fills geometry + params; the .mm fills wx0/wy0/CW/CH after the device bbox.
+// LAYOUT MUST MATCH the Metal struct exactly.
+struct CRGpuParams {
+	int   W, H;
+	int   srcPitch, dstPitch;
+	int   offX, offY;
+	int   inW, inH;
+	int   wx0, wy0, CW, CH;
+	float thr, feather, amount;
+	int   preserveAA, pad;
+};
+
+// Defined in CornerRounder_Metal.mm (Objective-C++). extern "C" so the .cpp links
+// against unmangled names.
+extern "C" bool CR_MetalCompile (void *devicePV, void **outData, char *errBuf, int errLen);
+extern "C" void CR_MetalDispose (void *dataPV);
+extern "C" bool CR_CornerRound_Metal (void *devicePV, void *queuePV, void *dataPV,
+									  void *srcMemPV, void *dstMemPV, CRGpuParams p,
+									  float rv, float rc, float profile);
+#endif
+
 /* Set once in GlobalSetup. Needed to reach the AEGP stream suites, which are
    the ONLY way to change param visibility at runtime in AE. */
 static AEGP_PluginID	S_cr_id = 0L;
@@ -1183,11 +1206,41 @@ GPUDeviceSetup (
 {
 	PF_Err err = PF_Err_NONE;
 
-	// We only handle CUDA. For any other framework we simply don't claim
-	// support, so AE keeps that device on the CPU path.
+	// CUDA (Windows): kernel is statically linked, nothing to build here - just
+	// claim F32 support. Any framework we don't handle is left on the CPU path.
 	if (extra->input->what_gpu == PF_GPU_Framework_CUDA) {
 		out_data->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
 	}
+#if HAS_METAL
+	// Metal (macOS): compile the MSL library and build the pipeline states once
+	// per device, stash them in gpu_data. On a compile error, surface Metal's
+	// own message in AE's error dialog so it can be read directly.
+	else if (extra->input->what_gpu == PF_GPU_Framework_METAL) {
+		PF_GPUDeviceSuite1 *gpu = NULL;
+		if (in_data->pica_basicP->AcquireSuite(kPFGPUDeviceSuite,
+				kPFGPUDeviceSuiteVersion1, (const void**)&gpu) || !gpu)
+			return PF_Err_BAD_CALLBACK_PARAM;
+
+		PF_GPUDeviceInfo info;
+		AEFX_CLR_STRUCT(info);
+		PF_Err e = gpu->GetDeviceInfo(in_data->effect_ref,
+					extra->input->device_index, &info);
+		in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+		if (e) return e;
+
+		void *metalData = NULL;
+		char  errBuf[512] = {0};
+		if (!CR_MetalCompile(info.devicePV, &metalData, errBuf, sizeof(errBuf))) {
+			PF_STRCPY(out_data->return_msg, "CornerRounder Metal build failed: ");
+			strncat(out_data->return_msg, errBuf,
+					sizeof(out_data->return_msg) - strlen(out_data->return_msg) - 1);
+			out_data->out_flags |= PF_OutFlag_DISPLAY_ERROR_MESSAGE;
+			return PF_Err_INTERNAL_STRUCT_DAMAGED;
+		}
+		extra->output->gpu_data = metalData;			// opaque; freed in Setdown
+		out_data->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+	}
+#endif
 	return err;
 }
 
@@ -1197,11 +1250,17 @@ GPUDeviceSetdown (
 	PF_OutData					*out_data,
 	PF_GPUDeviceSetdownExtra	*extra )
 {
+#if HAS_METAL
+	// Release the Metal pipeline states built in GPUDeviceSetup.
+	if (extra->input->what_gpu == PF_GPU_Framework_METAL && extra->input->gpu_data) {
+		CR_MetalDispose(const_cast<void*>(extra->input->gpu_data));
+	}
+#endif
 	// CUDA kernel is statically linked; nothing device-specific to release.
 	return PF_Err_NONE;
 }
 
-#if HAS_CUDA
+#if HAS_CUDA || HAS_METAL
 static PF_Err
 SmartRenderGPU (
 	PF_InData			*in_data,
@@ -1244,17 +1303,56 @@ SmartRenderGPU (
 			int offX = info->inRect.left - info->outRect.left;
 			int offY = info->inRect.top  - info->outRect.top;
 
-			CR_CornerRound_CUDA(
-				(const float*)src_mem, (float*)dst_mem,
-				srcPitch, dstPitch,
-				outputP->width, outputP->height,
-				offX, offY, inputP->width, inputP->height,
-				(float)info->threshold, (float)info->convexR, (float)info->concaveR,
-				(float)info->feather, (float)info->amount, (float)info->profile,
-				(int)info->preserveAA, (int)info->pad);
+#if HAS_CUDA
+			if (extra->input->what_gpu == PF_GPU_Framework_CUDA) {
+				CR_CornerRound_CUDA(
+					(const float*)src_mem, (float*)dst_mem,
+					srcPitch, dstPitch,
+					outputP->width, outputP->height,
+					offX, offY, inputP->width, inputP->height,
+					(float)info->threshold, (float)info->convexR, (float)info->concaveR,
+					(float)info->feather, (float)info->amount, (float)info->profile,
+					(int)info->preserveAA, (int)info->pad);
 
-			if (cudaPeekAtLastError() != cudaSuccess)
-				err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+				if (cudaPeekAtLastError() != cudaSuccess)
+					err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+			}
+#endif
+#if HAS_METAL
+			if (extra->input->what_gpu == PF_GPU_Framework_METAL) {
+				// Metal needs the device + command queue (CUDA used the default
+				// context). gpu_data holds the pipeline states built in setup.
+				PF_GPUDeviceInfo devInfo;
+				AEFX_CLR_STRUCT(devInfo);
+				ERR(gpu->GetDeviceInfo(in_data->effect_ref,
+						extra->input->device_index, &devInfo));
+				if (!err) {
+					CRGpuParams p;
+					AEFX_CLR_STRUCT(p);
+					p.W          = outputP->width;
+					p.H          = outputP->height;
+					p.srcPitch   = srcPitch;
+					p.dstPitch   = dstPitch;
+					p.offX       = offX;
+					p.offY       = offY;
+					p.inW        = inputP->width;
+					p.inH        = inputP->height;
+					p.thr        = (float)info->threshold;
+					p.feather    = (float)info->feather;
+					p.amount     = (float)info->amount;
+					p.preserveAA = (int)info->preserveAA;
+					p.pad        = (int)info->pad;
+					// wx0/wy0/CW/CH are filled by CR_CornerRound_Metal after bbox.
+
+					if (!CR_CornerRound_Metal(devInfo.devicePV, devInfo.command_queuePV,
+							const_cast<void*>(extra->input->gpu_data),
+							src_mem, dst_mem, p,
+							(float)info->convexR, (float)info->concaveR,
+							(float)info->profile))
+						err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+				}
+			}
+#endif
 		}
 	}
 
@@ -1262,7 +1360,7 @@ SmartRenderGPU (
 	suites.HandleSuite1()->host_unlock_handle(infoH);
 	return err;
 }
-#endif // HAS_CUDA
+#endif // HAS_CUDA || HAS_METAL
 
 /* Classic (non-Smart) render - simple passthrough. */
 static PF_Err
@@ -1345,7 +1443,7 @@ EffectMain(
 				err = GPUDeviceSetdown(in_data, out_data,
 						reinterpret_cast<PF_GPUDeviceSetdownExtra*>(extra));
 				break;
-#if HAS_CUDA
+#if HAS_CUDA || HAS_METAL
 			case PF_Cmd_SMART_RENDER_GPU:		// SmartFX phase 2: pixels (GPU)
 				err = SmartRenderGPU(in_data, out_data,
 						reinterpret_cast<PF_SmartRenderExtra*>(extra));
